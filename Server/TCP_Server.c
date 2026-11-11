@@ -1,136 +1,206 @@
-// // tcp_server.c
-// #include <stdio.h>
-// #include <stdlib.h>
-// #include <string.h>
-// #include <unistd.h>
-// #include <arpa/inet.h>
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#endif
+#define _POSIX_C_SOURCE 200809L
 
-// #define PORT 8080 // Port number to connect to the server
-// #define BUFFER_SIZE 101  // 100 bytes for data + 1 byte for type indicator
-
-// void handle_client(int client_socket) {//function to handle the client request 
-//     char filename[256];//to store the filename
-//     memset(filename, 0, sizeof(filename));//fill the first 256 bytes of filename with 0
-//     if (read(client_socket, filename, sizeof(filename)) <= 0) {//read the filename from the client socket and store in filename
-//         perror("Failed to read filename");
-//         close(client_socket);
-//         return;
-//     }
-    
-//     FILE *file = fopen(filename, "rb");//open file in binary mode  //what does rb do? //read binary mode
-//     char buffer[BUFFER_SIZE];//buffer to store the data to be sent to the client
-//     if (!file) {//if file is not found
-//         buffer[0] = 'E';  // Error indicator
-//         strcpy(buffer + 1, "Error: File not found\n");//copy the error message to the buffer
-//         send(client_socket, buffer, strlen(buffer), 0);//send the buffer to the client socket with the length of the buffer and 0 flags to tell that no special flags are set
-//     } else {
-//         buffer[0] = 'D';  // Data indicator
-//         size_t bytes_read;//to store the number of bytes read from the file
-//         while ((bytes_read = fread(buffer + 1, 1, 100, file)) > 0) {//what does each parameter do?  //read 100 bytes from file and store in buffer starting from index 1   
-//             send(client_socket, buffer, bytes_read + 1, 0);// send the buffer to client socket with bytes_read+1 bytes and 0 flags to tell that no special flags are set
-//         }
-//         fclose(file);
-//     }
-//     close(client_socket);
-// }
-
-// int main() {
-//     int server_fd, client_socket;//server file descriptor and client socket
-//     struct sockaddr_in address;//structure to store the client address
-//     socklen_t addr_len = sizeof(address);//length of the address
-
-//     server_fd = socket(AF_INET, SOCK_STREAM, 0);
-//     address.sin_family = AF_INET;
-//     address.sin_addr.s_addr = INADDR_ANY;//accept connections from any IP address
-//     address.sin_port = htons(PORT);
-
-//     bind(server_fd, (struct sockaddr *)&address, sizeof(address));//bind the server file descriptor to the address and the length of the address
-//     listen(server_fd, 5);//listen for incoming connections with a maximum of 5 connections in the queue
-
-//     while (1) {
-//         client_socket = accept(server_fd, (struct sockaddr *)&address, &addr_len);//accept the client connection and store the client socket
-//         if (client_socket >= 0) {
-//             handle_client(client_socket);//handle the client request
-//         }
-//     }
-//     close(server_fd);
-//     return 0;
-// }
-
-
-
-// tcp_server.c
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <errno.h>
 
-#define PORT 8080 // Port number to connect to the server
-#define BUFFER_SIZE 101  // 100 bytes for data + 1 byte for type indicator
+#define SERVER_PORT 8080
+#define BACKLOG 5
+#define MAX_FILENAME_LENGTH 256
+#define BUFFER_SIZE 4096
+#define FILE_DIRECTORY "files"
 
-void handle_client(int client_socket) {
-    char filename[256];
-    memset(filename, 0, sizeof(filename));
-    if (read(client_socket, filename, sizeof(filename)) <= 0) {
-        perror("Failed to read filename");
-        close(client_socket);
+static int send_all(int socket_fd, const void *data, size_t length)
+{
+    const unsigned char *bytes = data;
+    size_t sent = 0;
+
+    while (sent < length) {
+        ssize_t result = send(socket_fd, bytes + sent, length - sent, 0);
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (result <= 0) {
+            return -1;
+        }
+        sent += (size_t)result;
+    }
+
+    return 0;
+}
+
+static int receive_filename(int socket_fd, char filename[MAX_FILENAME_LENGTH])
+{
+    size_t length = 0;
+
+    while (length < MAX_FILENAME_LENGTH - 1) {
+        char character;
+        ssize_t result = recv(socket_fd, &character, 1, 0);
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (result <= 0) {
+            return -1;
+        }
+        if (character == '\0') {
+            filename[length] = '\0';
+            return length > 0 ? 0 : -1;
+        }
+        filename[length++] = character;
+    }
+
+    return -1;
+}
+
+static int is_valid_filename(const char *filename)
+{
+    if (strcmp(filename, ".") == 0 || strcmp(filename, "..") == 0) {
+        return 0;
+    }
+
+    for (const unsigned char *character = (const unsigned char *)filename;
+         *character != '\0'; character++) {
+        if (!isalnum(*character) && *character != '.' && *character != '_' &&
+            *character != '-') {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static void send_error(int socket_fd, const char *message)
+{
+    const unsigned char status = 'E';
+    if (send_all(socket_fd, &status, sizeof(status)) < 0 ||
+        send_all(socket_fd, message, strlen(message)) < 0) {
+        perror("Could not send error response");
+    }
+}
+
+static void handle_client(int client_fd)
+{
+    char filename[MAX_FILENAME_LENGTH];
+    if (receive_filename(client_fd, filename) < 0 ||
+        !is_valid_filename(filename)) {
+        send_error(client_fd, "Invalid filename.\n");
+        close(client_fd);
         return;
     }
 
-    printf("Requested filename: %s\n", filename); // Debug print
-
-    FILE *file = fopen(filename, "rb");
-    char buffer[BUFFER_SIZE];
-    if (!file) {
-        buffer[0] = 'E';  // Error indicator
-        strcpy(buffer + 1, "Error: File not found\n");
-        send(client_socket, buffer, strlen(buffer), 0);
-        perror("Error opening file"); // Debug print
-    } else {
-        buffer[0] = 'D';  // Data indicator
-        size_t bytes_read;
-        while ((bytes_read = fread(buffer + 1, 1, 100, file)) > 0) {
-            send(client_socket, buffer, bytes_read + 1, 0);
-        }
-        fclose(file);
+    int directory_fd = open(FILE_DIRECTORY, O_RDONLY | O_DIRECTORY);
+    if (directory_fd < 0) {
+        perror("Could not open file directory");
+        send_error(client_fd, "Server file directory is unavailable.\n");
+        close(client_fd);
+        return;
     }
-    close(client_socket);
+
+    int file_fd = openat(directory_fd, filename, O_RDONLY | O_NOFOLLOW);
+    close(directory_fd);
+    if (file_fd < 0) {
+        send_error(client_fd, "Requested file is unavailable.\n");
+        close(client_fd);
+        return;
+    }
+
+    struct stat file_info;
+    if (fstat(file_fd, &file_info) < 0 || !S_ISREG(file_info.st_mode)) {
+        close(file_fd);
+        send_error(client_fd, "Requested file is unavailable.\n");
+        close(client_fd);
+        return;
+    }
+
+    FILE *file = fdopen(file_fd, "rb");
+    if (file == NULL) {
+        perror("Could not open requested file stream");
+        close(file_fd);
+        send_error(client_fd, "Requested file is unavailable.\n");
+        close(client_fd);
+        return;
+    }
+
+    const unsigned char status = 'D';
+    if (send_all(client_fd, &status, sizeof(status)) < 0) {
+        perror("Could not send response status");
+    } else {
+        char buffer[BUFFER_SIZE];
+        size_t bytes_read;
+        while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+            if (send_all(client_fd, buffer, bytes_read) < 0) {
+                perror("Could not send file contents");
+                break;
+            }
+        }
+        if (ferror(file)) {
+            perror("Could not read requested file");
+        }
+    }
+
+    fclose(file);
+    close(client_fd);
 }
 
-int main() {
-    int server_fd, client_socket;
-    struct sockaddr_in address;
-    socklen_t addr_len = sizeof(address);
-
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
-
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("Bind failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
+int main(void)
+{
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("Could not create server socket");
+        return EXIT_FAILURE;
     }
 
-    if (listen(server_fd, 5) < 0) {
-        perror("Listen failed");
+    int reuse_address = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse_address,
+                   sizeof(reuse_address)) < 0) {
+        perror("Could not configure server socket");
         close(server_fd);
-        exit(EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
-    printf("Server is listening on port %d\n", PORT);
+    struct sockaddr_in server_address = {0};
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_address.sin_port = htons(SERVER_PORT);
 
-    while (1) {
-        client_socket = accept(server_fd, (struct sockaddr *)&address, &addr_len);
-        if (client_socket >= 0) {
-            handle_client(client_socket);
-        } else {
-            perror("Accept failed");
+    if (bind(server_fd, (struct sockaddr *)&server_address,
+             sizeof(server_address)) < 0) {
+        perror("Could not bind server socket");
+        close(server_fd);
+        return EXIT_FAILURE;
+    }
+
+    if (listen(server_fd, BACKLOG) < 0) {
+        perror("Could not listen on server socket");
+        close(server_fd);
+        return EXIT_FAILURE;
+    }
+
+    printf("Server listening on port %d\n", SERVER_PORT);
+    for (;;) {
+        struct sockaddr_in client_address;
+        socklen_t address_length = sizeof(client_address);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_address,
+                               &address_length);
+        if (client_fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("Could not accept client connection");
+            continue;
         }
+
+        handle_client(client_fd);
     }
-    close(server_fd);
-    return 0;
 }
